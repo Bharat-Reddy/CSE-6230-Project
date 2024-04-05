@@ -14,6 +14,8 @@
 #include <chrono>
 #include <mutex>
 #include "threadpool.hpp"
+// #include "parlay.h"
+
 template<typename Key, typename Value>
 struct entry {
 using key_t = Key;
@@ -133,25 +135,36 @@ private:
     pam_map<entry<Key, Value>> map_;
     std::vector<std::pair<Key, Value>> batch;
     threadpool pool;
+    // lock for batch
+    mutable std::mutex mutex;
 
 public:
     bool supports_batch_insert = true;
 
     void batch_insert(const std::vector<std::pair<Key, Value>>& batch) {
-        map_.multi_insert(map_, batch);
+        map_ = map_.multi_insert(map_, batch);
+    }
+
+    void insert(const Key& key, const Value& value) {
+        map_.insert(std::make_pair(key, value));
     }
 
     void batch_op(const Key& key, const Value& value) {
+        // acquire lock
+        std::lock_guard<std::mutex> lock(mutex);
         batch.emplace_back(std::make_pair(key, value));
 
         if (batch.size() == 10000) {
             // Let some background thread process the batch
-            std::vector<std::pair<Key, Value>> batch_copy;
-            batch_copy.swap(batch);
+            // std::vector<std::pair<Key, Value>> batch_copy;
+            // batch_copy.swap(batch);
 
-            pool.enqueue([&, batch_copy] {
-                map_.multi_insert(map_, batch_copy);
-            });
+            // pool.enqueue([&, batch_copy] {
+            //     map_ = map_.multi_insert(map_, batch_copy); // 5 seconds
+            // }); 
+            map_ = map_.multi_insert(map_, batch);
+            // map_.multi_find
+            batch.clear();
         }
     }
 
@@ -162,6 +175,14 @@ public:
         }
         return Value{};
     }
+
+    Value* multi_get(const std::vector<Key>& keys) const {
+        // return map_.multi_find(map_, parley::make_slice(keys));
+        // return map_.multi_find(map_, keys);
+    }
+
+
+
 };
 
 template<typename Key, typename Value>
@@ -170,9 +191,18 @@ class PAMConcurrentHashMap {
         pam_map<entry<Key, Value>> map_;
 
     public:
+        bool supports_batch_insert = false;
         void insert(const Key& key, const Value& value) {
             map_.insert(std::make_pair(key, value));
-            // map_.multi_insert
+        }
+
+        void batch_op(const Key& key, const Value& value) {
+            map_.insert(std::make_pair(key, value));
+        }
+
+        void batch_insert(const std::vector<std::pair<Key, Value>>& batch) {
+            map_ = map_.multi_insert(map_, batch);
+            // map_.multi_delete();
         }
 
         Value get(const Key& key) const {
@@ -181,6 +211,12 @@ class PAMConcurrentHashMap {
                 return it.value();
             }
             return Value{};
+        }
+
+        Value* multi_get(const std::vector<Key>& keys) const {
+            // parlay::internal::sample_sort(keys, entry<Key, Value>::comp);
+            // return map_.multi_find(map_, parley::make_slice(keys));
+            // return map_.multi_find(map_, keys);
         }
 };
 
@@ -283,134 +319,72 @@ public:
 template<typename DataStructure>
 class BatchParallelMapTest {
 public:
-    void test_insert_latency() {
+    void test_insert_latency(int n = 1000000) {
         DataStructure data_structure;
-        std::vector<std::pair<int, std::string>> batch;
         auto start = std::chrono::high_resolution_clock::now();
-        for (int i = 0; i < 1000000; ++i) {
-            batch.emplace_back(i, "Value " + std::to_string(i));
-        }
-        data_structure.batch_insert(batch);
         auto stop = std::chrono::high_resolution_clock::now();
+        if (!data_structure.supports_batch_insert) {
+            start = std::chrono::high_resolution_clock::now();
+            #pragma omp parallel for
+            for (int i = 0; i < n; ++i)
+                data_structure.insert(i, "Value " + std::to_string(i));
+            stop = std::chrono::high_resolution_clock::now();
+            
+        } else {
+            std::cout << "Batch insert" << std::endl;
+            start = std::chrono::high_resolution_clock::now();
+            #pragma omp parallel for
+            for (int i = 0; i < n; ++i) 
+                data_structure.batch_op(i, "Value " + std::to_string(i));
+            stop = std::chrono::high_resolution_clock::now();
+        }
         auto duration = std::chrono::duration_cast<std::chrono::microseconds>(stop - start);
-        std::cout << "Time taken by BatchParallelMap for 1000000 inserts: " << duration.count() << " microseconds" << std::endl;
+        // Time take by DataStructure for n inserts: 0 microseconds
+        // Print the data structure name using typeid
+        std::cout << "Time taken by " << typeid(DataStructure).name() << " for " << n << " inserts: " << duration.count() << " microseconds" << std::endl;
+        // Get value for key 10
+        std::cout << "Value for key 10: " << data_structure.get(10) << std::endl;
+        // std::vector<int> keys = {0, 1, 2, 3, 4, 5, 6, 7, 8, 9};
+        // std::string* values = data_structure.multi_get(keys);
+        // for (int i = 0; i < keys.size(); ++i) {
+        //     std::cout << "Value for key " << keys[i] << ": " << values[i] << std::endl;
+        // }
     }
 };
 
 
 int main() {
 
-    // pam_seq<entry<int, std::string>> seq_map;
-    // seq_map.insert(std::make_pair(1, "Value 1"));
+    // Use the test class to test the latency of each data structure
+    BatchParallelMapTest<BatchParallelConcurrentHashMap<int, std::string>> test;
+    // test.test_insert_latency(1000000);
+    // test.test_insert_latency(10000000);
+    // test.test_insert_latency(100000000);
 
-    // Start the clock
-    BatchParallelConcurrentHashMap<int, std::string> hash_table;
-    // Create a batch of key-value pairs to insert
-    std::vector<std::pair<int, std::string>> batch;
-    auto start = std::chrono::high_resolution_clock::now();
-    int n = 0;
-    for (int i = 0; i < 10; ++i) {
-        #pragma omp parallel for
-        for (int i = 0; i < 1000000; ++i) {
-            // batch.emplace_back(i, "Value " + std::to_string(i));
-            hash_table.batch_op(i, "Value " + std::to_string(i));
-            n++;
-        }
-    }
-    // Insert the batch in parallel
-    // hash_table.batch_insert(batch);
-    // Retrieve a value given a key
-    // Stop the clock
-    auto stop = std::chrono::high_resolution_clock::now();
-    // Calculate the duration
-    auto duration = std::chrono::duration_cast<std::chrono::microseconds>(stop - start);
-    // std::cout << "Time taken by BatchParallelConcurrentHashMap: " << duration.count() << " microseconds" << std::endl;
-    // Time take by BatchParallelConcurrentHashMap for n inserts: 0 microseconds
-    std::cout << "Time taken by BatchParallelConcurrentHashMap for " << n << " inserts: " << duration.count() << " microseconds" << std::endl;
-    std::cout << "Value for key 10: " << hash_table.get(10) << std::endl;
+    BatchParallelMapTest<PAMConcurrentHashMap<int, std::string>> test2;
+    test2.test_insert_latency(1000000);
+    test2.test_insert_latency(10000000);
+    // test2.test_insert_latency(100000000);
 
+    // BatchParallelMapTest<BatchParallelHashMap<int, std::string>> test3;
+    // test3.test_insert_latency(1000000);
+    // test3.test_insert_latency(10000000);
+    // test3.test_insert_latency(100000000);
 
-    PAMConcurrentHashMap<int, std::string> concurrent_hash_table;
-    n = 0;
-    start = std::chrono::high_resolution_clock::now();
-    for (int i = 0; i < 10; ++i) {
-        #pragma omp parallel for
-        for (int i = 0; i < 1000000; ++i) {
-            concurrent_hash_table.insert(i, "Value " + std::to_string(i));
-            n++;
-        }
-    }
-    // Retrieve a value given a key
-    stop = std::chrono::high_resolution_clock::now();
-    duration = std::chrono::duration_cast<std::chrono::microseconds>(stop - start);
-    std::cout << "Time taken by PAMConcurrentHashMap for " << n << " inserts: " << duration.count() << " microseconds" << std::endl;
-    std::cout << "Value for key 10: " << concurrent_hash_table.get(10) << std::endl;
+    // BatchParallelMapTest<ConcurrentHashMap<int, std::string>> test4;
+    // test4.test_insert_latency(1000000);
+    // test4.test_insert_latency(10000000);
+    // test4.test_insert_latency(100000000);
 
+    // BatchParallelMapTest<BatchParallelVector<int, std::string>> test5;
+    // test5.test_insert_latency(1000000);
+    // test5.test_insert_latency(10000000);
+    // test5.test_insert_latency(100000000);
 
-    BatchParallelHashMap<int, std::string> hash_map(10, 1000);
-    batch.clear();
-    n = 0;
-    start = std::chrono::high_resolution_clock::now();
-    for (int i = 0; i < 10; ++i) {
-        #pragma omp parallel for
-        for (int i = 0; i < 10000000; ++i) {
-            hash_map.batch_op(i, "Value " + std::to_string(i));
-            n++;
-        }
-    }
-
-    // hash_map.batch_insert(batch);
-    std::string value = hash_map.get(10);
-    stop = std::chrono::high_resolution_clock::now();
-    duration = std::chrono::duration_cast<std::chrono::microseconds>(stop - start);
-    std::cout << "Time taken by BatchParallelHashMap for " << n << " inserts: " << duration.count() << " microseconds" << std::endl;
-    std::cout << "Value for key 10: " << value << std::endl;
-
-
-    ConcurrentHashMap<int, std::string> concurrent_map;
-    n = 0;
-    start = std::chrono::high_resolution_clock::now();
-    #pragma omp parallel for
-    for (int i = 0; i < 100000000; ++i) {
-        concurrent_map.insert(i, "Value " + std::to_string(i));
-        n++;
-    }
-    value = hash_map.get(10);
-    stop = std::chrono::high_resolution_clock::now();
-    duration = std::chrono::duration_cast<std::chrono::microseconds>(stop - start);
-    std::cout << "Time taken by ConcurrentHashMap for " << n << " inserts: " << duration.count() << " microseconds" << std::endl;
-    std::cout << "Value for key 10: " << concurrent_map.get(10) << std::endl;
-
-    BatchParallelVector<int, std::string> vector(100000);
-    batch.clear();
-    start = std::chrono::high_resolution_clock::now();
-    n = 0;
-    for (int i = 0; i < 10; ++i) {
-        for (int i = 0; i < 1000000; ++i) {
-            batch.emplace_back(i, "Value " + std::to_string(i));
-            n++;
-        }
-        vector.batch_insert(batch);
-    }
-    stop = std::chrono::high_resolution_clock::now();
-    duration = std::chrono::duration_cast<std::chrono::microseconds>(stop - start);
-    std::cout << "Time taken by BatchParallelVector for " << n << " inserts: " << duration.count() << " microseconds" << std::endl;
-    std::cout << "Value for key 10: " << vector.get(10) << std::endl;
-
-    ConcurrentVector<int, std::string> concurrent_vector;
-    n = 0;
-    start = std::chrono::high_resolution_clock::now();
-    for (int i = 0; i < 10; ++i) {
-        #pragma omp parallel for
-        for (int i = 0; i < 1000000; ++i) {
-            concurrent_vector.insert(i, "Value " + std::to_string(i));
-            n++;
-        }
-    }
-    stop = std::chrono::high_resolution_clock::now();
-    duration = std::chrono::duration_cast<std::chrono::microseconds>(stop - start);
-    std::cout << "Time taken by ConcurrentVector for " << n << " inserts: " << duration.count() << " microseconds" << std::endl;
-    std::cout << "Value for key 10: " << concurrent_vector.get(10) << std::endl;
+    // BatchParallelMapTest<ConcurrentVector<int, std::string>> test6;
+    // test6.test_insert_latency(1000000);
+    // test6.test_insert_latency(10000000);
+    // test6.test_insert_latency(100000000);
 
     return 0;
 }
