@@ -131,13 +131,35 @@ class BatchParallelConcurrentHashMap {
 private:
 
     pam_map<entry<Key, Value>> map_;
+    std::vector<std::pair<Key, Value>> batch;
 
 public:
     void batch_insert(const std::vector<std::pair<Key, Value>>& batch) {
-        #pragma omp parallel for
-        for (int i = 0; i < batch.size(); ++i) {
-            const auto& kv = batch[i];
-            map_.insert(kv);
+        // #pragma omp parallel for
+        // for (int i = 0; i < batch.size(); ++i) {
+        //     const auto& kv = batch[i];
+        //     map_.insert(kv);
+        // }
+        map_.multi_insert(map_, batch);
+    }
+
+    void batch_op(const Key& key, const Value& value) {
+        batch.emplace_back(std::make_pair(key, value));
+
+        if (batch.size() == 100) {
+            // Let some background thread process the batch
+            std::vector<std::pair<Key, Value>> batch_copy;
+            batch_copy.swap(batch);
+
+            std::thread([&, batch_copy] {
+                // #pragma omp parallel for
+                // for (int i = 0; i < batch_copy.size(); ++i) {
+                //     const auto& kv = batch_copy[i];
+                //     map_.insert(kv);
+                // }
+                map_.multi_insert(map_, batch);
+                // map_.multi_insert(batch);
+            }).detach();
         }
     }
 
@@ -158,6 +180,7 @@ class PAMConcurrentHashMap {
     public:
         void insert(const Key& key, const Value& value) {
             map_.insert(std::make_pair(key, value));
+            // map_.multi_insert
         }
 
         Value get(const Key& key) const {
@@ -258,6 +281,9 @@ public:
 
 int main() {
 
+    pam_seq<entry<int, std::string>> seq_map;
+    seq_map.insert(std::make_pair(1, "Value 1"));
+
     // Start the clock
     BatchParallelConcurrentHashMap<int, std::string> hash_table;
     // Create a batch of key-value pairs to insert
@@ -267,6 +293,7 @@ int main() {
     for (int i = 0; i < 10; ++i) {
         for (int i = 0; i < 100000; ++i) {
             batch.emplace_back(i, "Value " + std::to_string(i));
+            // hash_table.batch_op(i, "Value " + std::to_string(i));
             n++;
         }
     }
@@ -305,6 +332,7 @@ int main() {
     n = 0;
     start = std::chrono::high_resolution_clock::now();
     for (int i = 0; i < 10; ++i) {
+        #pragma omp parallel for
         for (int i = 0; i < 10000000; ++i) {
             hash_map.batch_op(i, "Value " + std::to_string(i));
             n++;
