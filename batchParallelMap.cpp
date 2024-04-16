@@ -2,6 +2,7 @@
 #define BATCH_PARALLEL_MAP_HPP
 
 #include <vector>
+#include <fstream>
 #include <algorithm>
 #include <iostream>
 #include <omp.h>
@@ -104,9 +105,9 @@ public:
         map_ = map_.remove(map_, key);
     }
 
-    Value get(const Key& key) const {
-        finalize_batch_insert();
-        finalize_batch_delete();
+    Value get(const Key& key)/* const*/ {
+        //finalize_batch_insert();
+        //finalize_batch_delete();
         auto it = map_.find(key);
         if(it.has_value()) {
             return it.value();
@@ -225,6 +226,117 @@ public:
         //     std::cout << "Value for key " << keys[i] << ": " << values[i] << std::endl;
         // }
 
+    }
+
+    void test_ycsb_file(const std::string& loadFile, const std::string& txnFile, int num_threads) {
+        DataStructure map;
+        std::ifstream fileLoad(loadFile);
+        std::ifstream fileTxn(txnFile);
+
+        auto loadStart = std::chrono::high_resolution_clock::now();
+        auto loadStop = std::chrono::high_resolution_clock::now();
+
+        size_t sample_size = 10000000;
+
+        if (!fileLoad.is_open() || !fileTxn.is_open()) {
+            std::cerr << "Error opening files: " << loadFile << " or " << txnFile << std::endl;
+            return;
+        }
+
+        // Preprocess commands into a structured vector
+        std::vector<std::pair<std::string, uint64_t>> operations;
+        std::string line;
+        size_t total_lines = 0;
+        cout<<"starting Load"<<endl;
+        loadStart = std::chrono::high_resolution_clock::now();
+        while (std::getline(fileLoad, line)) {
+            std::istringstream iss(line);
+            std::string cmd;
+            uint64_t key;
+            iss >> cmd >> key;
+            if (cmd == "INSERT") {
+                map.insert(key, "Value " + std::to_string(key));
+            }
+        }
+        loadStop = std::chrono::high_resolution_clock::now();
+        auto loadDuration = std::chrono::duration_cast<std::chrono::microseconds>(loadStop - loadStart);
+
+        fileLoad.close();
+        cout<<"Load File Processing Complete"<<endl;
+        cout<<"Load took: "<<loadDuration.count()<<" microseconds"<<endl;
+
+        while (std::getline(fileTxn, line)) {
+            ++total_lines;
+        }
+
+        fileTxn.clear();
+        fileTxn.seekg(0, std::ios::beg);
+
+        // Uniform sampling
+        cout<<"Total Lines: "<<total_lines<<endl;
+        double sampling_rate = static_cast<double>(sample_size) / total_lines;
+        std::mt19937 rng;  // Random number generator
+        std::uniform_real_distribution<double> dist(0.0, 1.0);
+
+        while (std::getline(fileTxn, line)) {
+            //cout<<dist(rng)<<"''"<<sampling_rate<<endl;
+            if (dist(rng) < sampling_rate) {
+                std::istringstream iss(line);
+                std::string cmd;
+                uint64_t key;
+                iss >> cmd >> key;
+                operations.push_back({cmd, key});
+                if (operations.size() >= sample_size) break;
+            }
+        }
+        fileTxn.close();
+        cout<<"Txn File processing complete"<<endl;
+
+        //omp_set_num_threads(num_threads);
+        cout<<"Threads: "<<num_threads<<endl;
+        cout<<"operations: "<<operations.size()<<endl;
+        auto start = std::chrono::high_resolution_clock::now();
+        auto stop = std::chrono::high_resolution_clock::now();
+
+        if(map.supports_batch_insert) {
+            start = std::chrono::high_resolution_clock::now();
+            #pragma omp parallel for num_threads(num_threads)
+            for (int i = 0; i < operations.size(); ++i){
+                auto& op = operations[i];
+                if(op.first == "INSERT") {
+                    map.batch_insert(op.second, "Value " + std::to_string(op.second));
+                } else if(op.first == "READ") {
+                    map.get(op.second);
+                }
+            }
+            cout<<"Completed Loop"<<endl;
+            //map.finalize_batch_insert();
+            stop = std::chrono::high_resolution_clock::now();
+        } else {
+            start = std::chrono::high_resolution_clock::now();
+            #pragma omp parallel for num_threads(num_threads)
+            for (int i = 0; i < operations.size(); ++i){
+                auto& op = operations[i];
+                if(op.first == "INSERT") {
+                    map.insert(op.second, "Value " + std::to_string(op.second));
+                    //cout<<"Insert"<<endl;
+                } else if(op.first == "READ") {
+                    map.get(op.second);
+                    //cout<<"READ"<<endl;
+                }
+            }
+            stop = std::chrono::high_resolution_clock::now();
+        }
+        
+
+        auto duration = std::chrono::duration_cast<std::chrono::microseconds>(stop - start);
+
+        std::string name = typeid(DataStructure).name();
+        int status;
+        char* demangled_name = abi::__cxa_demangle(name.c_str(), 0, 0, &status);
+        demangled_name = strtok(demangled_name, "<");
+        std::cout << "Time taken by " << demangled_name << " to process file " << txnFile 
+                  << " with " << num_threads << " threads: " << duration.count() << " microseconds" << std::endl;
     }
 
     void test_batch_insert_latency(int n = 1000000, int batch_size = 1000, int num_threads = 1) {
@@ -402,16 +514,23 @@ int main() {
 
     int max_threads = std::thread::hardware_concurrency();
     std::cout << "Number of threads: " << max_threads << std::endl;
+
+    BatchParallelMapTest<BatchParallelConcurrentHashMap<uint64_t, std::string>> test0;
+    test0.test_ycsb_file("/home/hice1/bthotti3/scratch/uniform/loada_unif_int.dat", "/home/hice1/bthotti3/scratch/uniform/txnsa_unif_int.dat", max_threads);
+    cout<<"****************************"<<endl;
+    BatchParallelMapTest<PAMConcurrentHashMap<uint64_t, std::string>> pam_test;
+    pam_test.test_ycsb_file("/home/hice1/bthotti3/scratch/uniform/loada_unif_int.dat", "/home/hice1/bthotti3/scratch/uniform/txnsa_unif_int.dat", max_threads);
+
     BatchParallelMapTest<BatchParallelConcurrentHashMap<int, std::string>> test;
-    // test.test_insert_latency(1000, max_threads);
-    // test.test_insert_latency(10000, max_threads);
-    // test.test_insert_latency(100000, max_threads);
-    // test.test_insert_latency(500000, max_threads);
-    // test.test_insert_latency(1000000, max_threads);
-    // test.test_insert_latency(5000000, max_threads);
-    // test.test_insert_latency(10000000, max_threads);
-    // test.test_insert_latency(50000000, max_threads);
-    // test.test_insert_latency(100000000, max_threads);
+    //  test.test_insert_latency(1000, max_threads);
+    //  test.test_insert_latency(10000, max_threads);
+    //  test.test_insert_latency(100000, max_threads);
+    //  test.test_insert_latency(500000, max_threads);
+    //  test.test_insert_latency(1000000, max_threads);
+    //  test.test_insert_latency(5000000, max_threads);
+      test.test_insert_latency(10000000, max_threads);
+    //  test.test_insert_latency(50000000, max_threads);
+    //  test.test_insert_latency(100000000, max_threads);
 
 
     BatchParallelMapTest<PAMConcurrentHashMap<int, std::string>> test2;
@@ -419,9 +538,9 @@ int main() {
     // test2.test_insert_latency(10000, max_threads);
     // test2.test_insert_latency(100000, max_threads);
     // test2.test_insert_latency(500000, max_threads);
-    // test2.test_insert_latency(1000000, max_threads);
+    //test2.test_insert_latency(1000000, max_threads);
     // test2.test_insert_latency(5000000, max_threads);
-    // test2.test_insert_latency(10000000, max_threads);
+     test2.test_insert_latency(10000000, max_threads);
     // test2.test_insert_latency(50000000, max_threads);
     // test2.test_insert_latency(100000000, max_threads);
 
@@ -443,18 +562,18 @@ int main() {
     // test3.test_batch_insert_latency(10000000, 1000000, max_threads);
     // test3.test_batch_insert_latency(10000000, 10000000, max_threads);
 
-    BatchParallelMapTest<PAMConcurrentHashMap<int, std::string>> test4;
-    test4.test_find_latency(1000000, 1000, max_threads);
+    // BatchParallelMapTest<PAMConcurrentHashMap<int, std::string>> test4;
+    // test4.test_find_latency(1000000, 1000, max_threads);
 
-    BatchParallelMapTest<BatchParallelConcurrentHashMap<int, std::string>> test5;
-    // There is no batch parallel find
-    test5.test_find_latency(1000000, 1000, max_threads);
+    // BatchParallelMapTest<BatchParallelConcurrentHashMap<int, std::string>> test5;
+    // // There is no batch parallel find
+    // test5.test_find_latency(1000000, 1000, max_threads);
 
-    BatchParallelMapTest<BatchParallelConcurrentHashMap<int, std::string>> test6;
-    test6.test_delete_latency(1000000, max_threads);
+    // BatchParallelMapTest<BatchParallelConcurrentHashMap<int, std::string>> test6;
+    // test6.test_delete_latency(1000000, max_threads);
 
-    BatchParallelMapTest<PAMConcurrentHashMap<int, std::string>> test7;
-    test7.test_delete_latency(1000000, max_threads);
+    // BatchParallelMapTest<PAMConcurrentHashMap<int, std::string>> test7;
+    // test7.test_delete_latency(1000000, max_threads);
     return 0;
 
 }
