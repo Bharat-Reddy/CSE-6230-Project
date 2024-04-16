@@ -105,8 +105,8 @@ public:
     }
 
     Value get(const Key& key) const {
-        finalize_batch_insert();
-        finalize_batch_delete();
+        // finalize_batch_insert();
+        // finalize_batch_delete();
         auto it = map_.find(key);
         if(it.has_value()) {
             return it.value();
