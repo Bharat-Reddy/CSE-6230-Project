@@ -17,6 +17,9 @@
 #include "threadpool.hpp"
 #include "concurrentqueue/concurrentqueue.h" //https://github.com/cameron314/concurrentqueue
 #include <cxxabi.h>
+#include "tbb/concurrent_hash_map.h"
+#include "tbb/blocked_range.h"
+#include "tbb/parallel_for.h"
 
 
 template<typename Key, typename Value>
@@ -173,6 +176,46 @@ class PAMConcurrentHashMap {
             // not implemented
             return nullptr;
         }
+};
+
+template<typename Key, typename Value>
+class TBBConcurrentHashMap {
+private:
+    tbb::concurrent_hash_map<Key, Value> map_;
+
+public:
+    bool supports_batch_insert = false;
+    bool supports_batch_delete = false;
+    bool supports_multi_get = false;
+
+    TBBConcurrentHashMap() {}
+
+    void insert(const Key& key, const Value& value) {
+        typename tbb::concurrent_hash_map<Key, Value>::accessor accessor;
+        map_.insert(accessor, key);
+        accessor->second = value;
+        accessor.release();
+    }
+
+    void _delete(const Key& key) {
+        map_.erase(key);
+    }
+
+    void batch_insert(const Key& key, const Value& value) {
+        insert(key, value);
+    }
+
+    void remove(const Key& key) {
+        _delete(key);
+    }
+
+    Value get(const Key& key) {
+        typename tbb::concurrent_hash_map<Key, Value>::const_accessor accessor;
+        if (map_.find(accessor, key)) {
+            return accessor->second;
+        }
+        return Value{}; // Return default value if not found
+    }
 };
 
 
@@ -515,36 +558,39 @@ int main() {
     int max_threads = std::thread::hardware_concurrency();
     std::cout << "Number of threads: " << max_threads << std::endl;
 
-    BatchParallelMapTest<BatchParallelConcurrentHashMap<uint64_t, std::string>> test0;
-    test0.test_ycsb_file("/home/hice1/bthotti3/scratch/uniform/loada_unif_int.dat", "/home/hice1/bthotti3/scratch/uniform/txnsa_unif_int.dat", max_threads);
-    cout<<"****************************"<<endl;
-    BatchParallelMapTest<PAMConcurrentHashMap<uint64_t, std::string>> pam_test;
-    pam_test.test_ycsb_file("/home/hice1/bthotti3/scratch/uniform/loada_unif_int.dat", "/home/hice1/bthotti3/scratch/uniform/txnsa_unif_int.dat", max_threads);
+    BatchParallelMapTest<TBBConcurrentHashMap<uint64_t, std::string>> tbb_test;
+    tbb_test.test_ycsb_file("/home/hice1/bthotti3/scratch/uniform/loada_unif_int.dat", "/home/hice1/bthotti3/scratch/uniform/txnsa_unif_int.dat", 16);
 
-    BatchParallelMapTest<BatchParallelConcurrentHashMap<int, std::string>> test;
+    // BatchParallelMapTest<BatchParallelConcurrentHashMap<uint64_t, std::string>> test0;
+    // test0.test_ycsb_file("/home/hice1/bthotti3/scratch/uniform/loada_unif_int.dat", "/home/hice1/bthotti3/scratch/uniform/txnsa_unif_int.dat", max_threads);
+    // cout<<"****************************"<<endl;
+    // BatchParallelMapTest<PAMConcurrentHashMap<uint64_t, std::string>> pam_test;
+    // pam_test.test_ycsb_file("/home/hice1/bthotti3/scratch/uniform/loada_unif_int.dat", "/home/hice1/bthotti3/scratch/uniform/txnsa_unif_int.dat", max_threads);
+
+    //BatchParallelMapTest<BatchParallelConcurrentHashMap<int, std::string>> test;
     //  test.test_insert_latency(1000, max_threads);
     //  test.test_insert_latency(10000, max_threads);
     //  test.test_insert_latency(100000, max_threads);
     //  test.test_insert_latency(500000, max_threads);
     //  test.test_insert_latency(1000000, max_threads);
     //  test.test_insert_latency(5000000, max_threads);
-      test.test_insert_latency(10000000, max_threads);
+    //  test.test_insert_latency(10000000, max_threads);
     //  test.test_insert_latency(50000000, max_threads);
     //  test.test_insert_latency(100000000, max_threads);
 
 
-    BatchParallelMapTest<PAMConcurrentHashMap<int, std::string>> test2;
+    //BatchParallelMapTest<PAMConcurrentHashMap<int, std::string>> test2;
     // test2.test_insert_latency(1000, max_threads);
     // test2.test_insert_latency(10000, max_threads);
     // test2.test_insert_latency(100000, max_threads);
     // test2.test_insert_latency(500000, max_threads);
     //test2.test_insert_latency(1000000, max_threads);
     // test2.test_insert_latency(5000000, max_threads);
-     test2.test_insert_latency(10000000, max_threads);
+    // test2.test_insert_latency(10000000, max_threads);
     // test2.test_insert_latency(50000000, max_threads);
     // test2.test_insert_latency(100000000, max_threads);
 
-    BatchParallelMapTest<BatchParallelConcurrentHashMap<int, std::string>> test3;
+    //BatchParallelMapTest<BatchParallelConcurrentHashMap<int, std::string>> test3;
     // test3.test_batch_insert_latency(1000000, 1000, max_threads);
     // test3.test_batch_insert_latency(1000000, 10000, max_threads);
     // test3.test_batch_insert_latency(1000000, 100000, max_threads);
