@@ -14,6 +14,7 @@
 #include <omp.h>
 #include <chrono>
 #include <mutex>
+#include <shared_mutex>
 #include "threadpool.hpp"
 #include "concurrentqueue/concurrentqueue.h" //https://github.com/cameron314/concurrentqueue
 #include <cxxabi.h>
@@ -128,6 +129,104 @@ public:
     }
 
 };
+
+template<typename Key, typename Value>
+class BatchParallelConcurrentHashMapWithUnion {
+private:
+
+    pam_map<entry<Key, Value>> map_;
+    moodycamel::ConcurrentQueue<std::pair<Key, Value>> insert_queue;
+    moodycamel::ConcurrentQueue<Key> delete_queue;
+    moodycamel::ConcurrentQueue<Key> find_queue;
+    std::mutex insertMutex, deleteMutex;
+    int approx_size_bound = 10000;
+    int dequeue_buffer_size = approx_size_bound * 2;
+    pam_map<entry<Key, Value>> main_map; // Primary map
+    std::mutex merge_mutex; // Mutex for merging maps
+    
+
+public:
+    bool supports_batch_insert = true;
+    bool supports_batch_delete = true;
+    bool supports_multi_get = false;
+    int batch_threshold = 10000;
+    static thread_local pam_map<entry<Key, Value>> thread_local_map; // Thread-local map to accumulate batch inserts
+
+    BatchParallelConcurrentHashMapWithUnion(int batch_size = 10000) {
+        approx_size_bound = batch_size;
+        cout<<"Batch Size: "<<batch_size<<endl;
+        dequeue_buffer_size = batch_size * 2;
+    }
+
+    void batch_insert(const Key& key, const Value& value) {
+        
+        
+        thread_local_map.insert(std::make_pair(key, value));
+
+        if (thread_local_map.size() >= batch_threshold) {
+            merge_maps(thread_local_map);
+            thread_local_map.clear(); // Clear the thread-local map after merging
+        }
+    }
+    void merge_maps(const pam_map<entry<Key, Value>>& other_map) {
+        std::lock_guard<std::mutex> lock(merge_mutex);
+        main_map = main_map.map_union(main_map, other_map, [](const Value& a, const Value& b) { 
+            return a; // Define how to merge values with the same key, here we simply pick `a`
+        });
+    }
+
+    void batch_delete(const Key& key) {
+        delete_queue.enqueue(key);
+        if(delete_queue.size_approx() > approx_size_bound) {
+            Key tmp[dequeue_buffer_size];
+            size_t count = delete_queue.try_dequeue_bulk(tmp, dequeue_buffer_size);
+            std::vector<Key> batch(tmp, tmp + count);
+            std::lock_guard<std::mutex> guard(deleteMutex);
+            map_ = map_.multi_delete(map_, batch);
+        }
+    }
+
+
+    void finalize_batch_insert() {
+        if (!thread_local_map.is_empty()) {
+            merge_maps(thread_local_map);
+            thread_local_map.clear();
+        }
+    }
+    
+    void finalize_batch_delete() {
+        Key tmp[dequeue_buffer_size];
+        size_t count = delete_queue.try_dequeue_bulk(tmp, dequeue_buffer_size);
+        std::vector<Key> batch(tmp, tmp + count);
+        std::lock_guard<std::mutex> guard(deleteMutex);
+        map_ = map_.multi_delete(map_, batch);
+    }
+
+    void insert(const Key& key, const Value& value) {
+        map_.insert(std::make_pair(key, value));
+    }
+
+    void remove(const Key& key) {
+        map_ = map_.remove(map_, key);
+    }
+
+    Value get(const Key& key) {
+        auto it = main_map.find(key);
+        auto itl = thread_local_map.find(key);
+        if (it.has_value()) {
+            return it.value();
+        } else if (itl.has_value()){
+            finalize_batch_insert();
+            return itl.value();
+        }
+        return Value{};
+    }
+
+};
+
+// Definition outside the class
+template<typename Key, typename Value>
+thread_local pam_map<entry<Key, Value>> thread_local_map;
 
 template<typename Key, typename Value>
 class PAMConcurrentHashMap {
@@ -342,6 +441,7 @@ public:
         auto stop = std::chrono::high_resolution_clock::now();
 
         if(map.supports_batch_insert) {
+            cout<<"Batch Inserting..."<<endl;
             start = std::chrono::high_resolution_clock::now();
             #pragma omp parallel for num_threads(num_threads)
             for (int i = 0; i < operations.size(); ++i){
@@ -551,6 +651,9 @@ public:
 
 };
 
+// Initialize the static thread_local member
+template<typename Key, typename Value>
+thread_local pam_map<entry<Key, Value>> BatchParallelConcurrentHashMapWithUnion<Key, Value>::thread_local_map = pam_map<entry<Key, Value>>();
 
 
 int main() {
@@ -559,8 +662,12 @@ int main() {
     std::cout << "Number of threads: " << max_threads << std::endl;
 
     BatchParallelMapTest<TBBConcurrentHashMap<uint64_t, std::string>> tbb_test;
-    tbb_test.test_ycsb_file("/home/hice1/bthotti3/scratch/uniform/loada_unif_int.dat", "/home/hice1/bthotti3/scratch/uniform/txnsa_unif_int.dat", 16);
+    //tbb_test.test_ycsb_file("/home/hice1/bthotti3/scratch/uniform/loada_unif_int.dat", "/home/hice1/bthotti3/scratch/uniform/txnsa_unif_int.dat", 16);
 
+    cout<<"****************************"<<endl;
+    BatchParallelMapTest<BatchParallelConcurrentHashMapWithUnion<uint64_t, std::string>> test_union;
+    test_union.test_ycsb_file("/home/hice1/bthotti3/scratch/zipfian/loada_unif_int.dat", "/home/hice1/bthotti3/scratch/zipfian/txnsa_unif_int.dat", max_threads);
+    
     // BatchParallelMapTest<BatchParallelConcurrentHashMap<uint64_t, std::string>> test0;
     // test0.test_ycsb_file("/home/hice1/bthotti3/scratch/uniform/loada_unif_int.dat", "/home/hice1/bthotti3/scratch/uniform/txnsa_unif_int.dat", max_threads);
     // cout<<"****************************"<<endl;
